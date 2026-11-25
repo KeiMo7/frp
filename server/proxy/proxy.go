@@ -266,6 +266,12 @@ func (pxy *BaseProxy) startCommonTCPListenersHandler() {
 
 // HandleUserTCPConnection is used for incoming user TCP connections.
 func (pxy *BaseProxy) handleUserTCPConnection(userConn net.Conn) {
+	pxy.handleUserTCPConnectionWithPreface(userConn, nil)
+}
+
+type workConnPrefaceFunc func(workConn net.Conn) error
+
+func (pxy *BaseProxy) handleUserTCPConnectionWithPreface(userConn net.Conn, preface workConnPrefaceFunc) {
 	xl := xlog.FromContextSafe(pxy.Context())
 	defer userConn.Close()
 
@@ -290,6 +296,13 @@ func (pxy *BaseProxy) handleUserTCPConnection(userConn net.Conn) {
 		return
 	}
 	defer workConn.Close()
+
+	if preface != nil {
+		if err := preface(workConn); err != nil {
+			xl.Warnf("write work connection preface error: %v", err)
+			return
+		}
+	}
 
 	var local io.ReadWriteCloser = workConn
 	xl.Tracef("handler user tcp connection, use_encryption: %t, use_compression: %t",

@@ -22,6 +22,7 @@ import (
 
 	v1 "github.com/fatedier/frp/pkg/config/v1"
 	"github.com/fatedier/frp/pkg/msg"
+	"github.com/fatedier/frp/pkg/nathole"
 )
 
 func init() {
@@ -60,9 +61,24 @@ func (pxy *XTCPProxy) Run() (remoteAddr string, err error) {
 	if len(allowUsers) == 0 {
 		allowUsers = []string{pxy.GetUserInfo().User}
 	}
-	sidCh, err := pxy.rc.NatHoleController.ListenClient(pxy.GetName(), pxy.cfg.Secretkey, allowUsers)
+	sidCh, err := pxy.rc.NatHoleController.ListenClientWithOptions(pxy.GetName(), pxy.cfg.Secretkey, allowUsers, nathole.ClientListenOptions{
+		ProxyUser:    pxy.GetUserInfo().User,
+		RelayEnabled: pxy.serverCfg != nil && pxy.serverCfg.ResolvedNatHole().RelayAllowed(),
+		RelayCapable: pxy.cfg.ServerRelayFallbackEnabled(),
+	})
 	if err != nil {
 		return "", err
+	}
+	if pxy.serverCfg != nil && pxy.serverCfg.ResolvedNatHole().RelayAllowed() {
+		relayListener, listenErr := pxy.rc.VisitorManager.Listen(pxy.GetName(), pxy.cfg.Secretkey, allowUsers)
+		if listenErr != nil {
+			xl.Warnf("start xtcp relay listener error: %v", listenErr)
+			pxy.rc.NatHoleController.SetClientRelayEnabled(pxy.GetName(), false)
+		} else {
+			pxy.listeners = append(pxy.listeners, relayListener)
+			xl.Infof("xtcp server relay fallback listener ready")
+			go pxy.acceptRelayVisitorConns(relayListener)
+		}
 	}
 	go func() {
 		for {
@@ -85,6 +101,25 @@ func (pxy *XTCPProxy) Run() (remoteAddr string, err error) {
 	return
 }
 
+func (pxy *XTCPProxy) acceptRelayVisitorConns(l net.Listener) {
+	xl := pxy.xl
+	for {
+		userConn, err := l.Accept()
+		if err != nil {
+			xl.Debugf("xtcp relay listener closed: %v", err)
+			return
+		}
+		go func(conn net.Conn) {
+			pxy.handleUserTCPConnectionWithPreface(conn, func(workConn net.Conn) error {
+				if err := writeRelayNatHoleSid(workConn, pxy.wireProtocol); err != nil {
+					return err
+				}
+				return writeRelayVisitorAck(conn, wireProtocolFromConn(conn))
+			})
+		}(userConn)
+	}
+}
+
 func writeNatHoleSid(workConn net.Conn, wireProtocol string, sid string) error {
 	workMsgConn := msg.NewConn(workConn, msg.NewReadWriter(workConn, wireProtocol))
 	return workMsgConn.WriteMsg(&msg.NatHoleSid{
@@ -92,9 +127,26 @@ func writeNatHoleSid(workConn net.Conn, wireProtocol string, sid string) error {
 	})
 }
 
+func writeRelayNatHoleSid(workConn net.Conn, wireProtocol string) error {
+	workMsgConn := msg.NewConn(workConn, msg.NewReadWriter(workConn, wireProtocol))
+	return workMsgConn.WriteMsg(&msg.NatHoleSid{
+		Sid:   "relay",
+		Relay: true,
+	})
+}
+
+func writeRelayVisitorAck(userConn net.Conn, wireProtocol string) error {
+	userMsgWriter := msg.NewReadWriter(userConn, wireProtocol)
+	return userMsgWriter.WriteMsg(&msg.NatHoleSid{
+		Sid:   "relay",
+		Relay: true,
+	})
+}
+
 func (pxy *XTCPProxy) Close() {
 	pxy.closeOnce.Do(func() {
 		pxy.BaseProxy.Close()
+		pxy.rc.VisitorManager.CloseListener(pxy.GetName())
 		pxy.rc.NatHoleController.CloseClient(pxy.GetName())
 		close(pxy.closeCh)
 	})

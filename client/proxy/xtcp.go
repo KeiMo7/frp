@@ -63,6 +63,15 @@ func (pxy *XTCPProxy) InWorkConn(conn net.Conn, startWorkConnMsg *msg.StartWorkC
 		return
 	}
 
+	// Server relay fallback reuses this work connection as the provider leg.
+	// The server has already authenticated the matching NewVisitorConn and is
+	// waiting to join this conn to that visitor connection.
+	if natHoleSidMsg.Relay {
+		xl.Debugf("xtcp work connection attached to server relay")
+		pxy.HandleTCPWorkConnection(conn, startWorkConnMsg, []byte(pxy.cfg.Secretkey))
+		return
+	}
+
 	xl.Tracef("nathole prepare start")
 
 	// Prepare NAT traversal options
@@ -77,8 +86,8 @@ func (pxy *XTCPProxy) InWorkConn(conn net.Conn, startWorkConnMsg *msg.StartWorkC
 		return
 	}
 
-	xl.Infof("nathole prepare success, nat type: %s, behavior: %s, addresses: %v, assistedAddresses: %v",
-		prepareResult.NatType, prepareResult.Behavior, prepareResult.Addrs, prepareResult.AssistedAddrs)
+	xl.Infof("nathole prepare success, nat type: %s, behavior: %s, addresses: %d, assistedAddresses: %d",
+		prepareResult.NatType, prepareResult.Behavior, len(prepareResult.Addrs), len(prepareResult.AssistedAddrs))
 	defer prepareResult.ListenConn.Close()
 
 	// send NatHoleClient msg to server
@@ -89,6 +98,7 @@ func (pxy *XTCPProxy) InWorkConn(conn net.Conn, startWorkConnMsg *msg.StartWorkC
 		Sid:           natHoleSidMsg.Sid,
 		MappedAddrs:   prepareResult.Addrs,
 		AssistedAddrs: prepareResult.AssistedAddrs,
+		RelayCapable:  pxy.cfg.ServerRelayFallbackEnabled(),
 	}
 
 	xl.Tracef("nathole exchange info start")
@@ -98,9 +108,22 @@ func (pxy *XTCPProxy) InWorkConn(conn net.Conn, startWorkConnMsg *msg.StartWorkC
 		return
 	}
 
-	xl.Infof("get natHoleRespMsg, sid [%s], protocol [%s], candidate address %v, assisted address %v, detectBehavior: %+v",
-		natHoleRespMsg.Sid, natHoleRespMsg.Protocol, natHoleRespMsg.CandidateAddrs,
-		natHoleRespMsg.AssistedAddrs, natHoleRespMsg.DetectBehavior)
+	xl.Infof("get natHoleRespMsg, sid [%s], protocol [%s], candidate addresses: %d, assisted addresses: %d",
+		natHoleRespMsg.Sid, natHoleRespMsg.Protocol, len(natHoleRespMsg.CandidateAddrs),
+		len(natHoleRespMsg.AssistedAddrs))
+
+	decisionWaiter := nathole.DefaultDecisionHub.Register(natHoleRespMsg.Sid)
+	go func() {
+		defer nathole.DefaultDecisionHub.Unregister(natHoleRespMsg.Sid, decisionWaiter)
+		select {
+		case decision := <-decisionWaiter.C():
+			if decision != nil {
+				xl.Infof("nat hole decision sid [%s]: %s %s", decision.Sid, decision.Outcome, decision.Reason)
+			}
+		case <-time.After(45 * time.Second):
+		case <-pxy.ctx.Done():
+		}
+	}()
 
 	listenConn := prepareResult.ListenConn
 	newListenConn, raddr, err := nathole.MakeHole(pxy.ctx, listenConn, natHoleRespMsg, []byte(pxy.cfg.Secretkey))
@@ -114,7 +137,7 @@ func (pxy *XTCPProxy) InWorkConn(conn net.Conn, startWorkConnMsg *msg.StartWorkC
 		return
 	}
 	listenConn = newListenConn
-	xl.Infof("establishing nat hole connection successful, sid [%s], remoteAddr [%s]", natHoleRespMsg.Sid, raddr)
+	xl.Infof("establishing nat hole connection successful, sid [%s]", natHoleRespMsg.Sid)
 
 	_ = pxy.msgTransporter.Send(&msg.NatHoleReport{
 		Sid:     natHoleRespMsg.Sid,

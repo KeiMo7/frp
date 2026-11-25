@@ -26,6 +26,7 @@ import (
 	v1 "github.com/fatedier/frp/pkg/config/v1"
 	"github.com/fatedier/frp/pkg/msg"
 	"github.com/fatedier/frp/pkg/naming"
+	"github.com/fatedier/frp/pkg/nathole"
 	"github.com/fatedier/frp/pkg/transport"
 	"github.com/fatedier/frp/pkg/util/wait"
 	"github.com/fatedier/frp/pkg/util/xlog"
@@ -186,6 +187,13 @@ func (ctl *Control) handleNatHoleResp(m msg.Message) {
 	}
 }
 
+func (ctl *Control) handleNatHoleDecision(m msg.Message) {
+	inMsg := m.(*msg.NatHoleDecision)
+	if !nathole.NotifyDecision(inMsg) {
+		ctl.xl.Debugf("nat hole decision sid [%s] has no local waiter", inMsg.Sid)
+	}
+}
+
 func (ctl *Control) handlePong(m msg.Message) {
 	xl := ctl.xl
 	inMsg := m.(*msg.Pong)
@@ -233,6 +241,7 @@ func (ctl *Control) registerMsgHandlers() {
 	ctl.msgDispatcher.RegisterHandler(&msg.ReqWorkConn{}, msg.AsyncHandler(ctl.handleReqWorkConn))
 	ctl.msgDispatcher.RegisterHandler(&msg.NewProxyResp{}, ctl.handleNewProxyResp)
 	ctl.msgDispatcher.RegisterHandler(&msg.NatHoleResp{}, ctl.handleNatHoleResp)
+	ctl.msgDispatcher.RegisterHandler(&msg.NatHoleDecision{}, ctl.handleNatHoleDecision)
 	ctl.msgDispatcher.RegisterHandler(&msg.Pong{}, ctl.handlePong)
 }
 

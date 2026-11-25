@@ -43,6 +43,9 @@ var _ = ginkgo.Describe("[Feature: XTCP]", func() {
 			`, framework.TCPEchoServerPort, bindPortName)
 
 		f.RunProcesses(serverConf, []string{clientConf})
+		framework.ExpectNoError(framework.WaitForTCPReady(
+			fmt.Sprintf("127.0.0.1:%d", f.PortByName(bindPortName)), 5*time.Second,
+		))
 		framework.NewRequestExpect(f).
 			RequestModify(func(r *request.Request) {
 				r.Timeout(time.Second)

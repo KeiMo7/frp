@@ -149,6 +149,10 @@ type XTCPVisitorConfig struct {
 	MinRetryInterval  int    `json:"minRetryInterval,omitempty"`
 	FallbackTo        string `json:"fallbackTo,omitempty"`
 	FallbackTimeoutMs int    `json:"fallbackTimeoutMs,omitempty"`
+	// ServerRelayFallback controls whether this new client accepts frps relay
+	// takeover. Nil means enabled for protocol-capable clients; an explicit
+	// false disables it. The server policy remains authoritative.
+	ServerRelayFallback *bool `json:"serverRelayFallback,omitempty"`
 
 	// NatTraversal configuration for NAT traversal
 	NatTraversal *NatTraversalConfig `json:"natTraversal,omitempty"`
@@ -161,6 +165,10 @@ func (c *XTCPVisitorConfig) Complete() {
 	c.MaxRetriesAnHour = util.EmptyOr(c.MaxRetriesAnHour, 8)
 	c.MinRetryInterval = util.EmptyOr(c.MinRetryInterval, 90)
 	c.FallbackTimeoutMs = util.EmptyOr(c.FallbackTimeoutMs, 1000)
+}
+
+func (c *XTCPVisitorConfig) ServerRelayFallbackEnabled() bool {
+	return c.ServerRelayFallback == nil || *c.ServerRelayFallback
 }
 
 func (c *XTCPVisitorConfig) Clone() VisitorConfigurer {

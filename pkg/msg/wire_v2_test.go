@@ -85,6 +85,7 @@ func TestV2MessageTypeIDsAreStable(t *testing.T) {
 	require.Equal(t, uint16(17), V2TypeNatHoleSid)
 	require.Equal(t, uint16(18), V2TypeNatHoleReport)
 	require.Equal(t, uint16(19), V2TypeUDPPacketBinary)
+	require.Equal(t, uint16(20), V2TypeNatHoleDecision)
 	_, registered := v2MsgTypeMap[V2TypeUDPPacketBinary]
 	require.False(t, registered, "binary UDP has a dedicated codec and must not alter generic type registry")
 }

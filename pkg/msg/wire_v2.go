@@ -44,6 +44,7 @@ const (
 	V2TypeNatHoleSid         uint16 = 17
 	V2TypeNatHoleReport      uint16 = 18
 	V2TypeUDPPacketBinary    uint16 = 19
+	V2TypeNatHoleDecision    uint16 = 20
 )
 
 var v2MsgTypeMap = map[uint16]any{
@@ -65,6 +66,7 @@ var v2MsgTypeMap = map[uint16]any{
 	V2TypeNatHoleResp:        NatHoleResp{},
 	V2TypeNatHoleSid:         NatHoleSid{},
 	V2TypeNatHoleReport:      NatHoleReport{},
+	V2TypeNatHoleDecision:    NatHoleDecision{},
 }
 
 var v2MsgReflectTypeMap, v2MsgTypeIDMap = buildV2MsgTypeMaps()

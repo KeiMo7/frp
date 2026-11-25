@@ -476,6 +476,9 @@ type XTCPProxyConfig struct {
 
 	Secretkey  string   `json:"secretKey,omitempty"`
 	AllowUsers []string `json:"allowUsers,omitempty"`
+	// ServerRelayFallback controls provider support for relay-marked work
+	// connections. Nil means enabled for new clients; explicit false disables.
+	ServerRelayFallback *bool `json:"serverRelayFallback,omitempty"`
 
 	// NatTraversal configuration for NAT traversal
 	NatTraversal *NatTraversalConfig `json:"natTraversal,omitempty"`
@@ -486,6 +489,11 @@ func (c *XTCPProxyConfig) MarshalToMsg(m *msg.NewProxy) {
 
 	m.Sk = c.Secretkey
 	m.AllowUsers = c.AllowUsers
+	m.SkRelayFallback = c.ServerRelayFallbackEnabled()
+}
+
+func (c *XTCPProxyConfig) ServerRelayFallbackEnabled() bool {
+	return c.ServerRelayFallback == nil || *c.ServerRelayFallback
 }
 
 func (c *XTCPProxyConfig) UnmarshalFromMsg(m *msg.NewProxy) {
@@ -493,6 +501,8 @@ func (c *XTCPProxyConfig) UnmarshalFromMsg(m *msg.NewProxy) {
 
 	c.Secretkey = m.Sk
 	c.AllowUsers = m.AllowUsers
+	enabled := m.SkRelayFallback
+	c.ServerRelayFallback = &enabled
 }
 
 func (c *XTCPProxyConfig) Clone() ProxyConfigurer {

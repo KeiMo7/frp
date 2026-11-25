@@ -94,6 +94,17 @@ type ServerConfig struct {
 	// NatHoleAnalysisDataReserveHours specifies the hours to reserve nat hole analysis data.
 	NatHoleAnalysisDataReserveHours int64 `json:"natholeAnalysisDataReserveHours,omitempty"`
 
+	// NatHole configures xtcp negotiation lifecycle and optional server-side
+	// relay fallback. The zero value preserves historical behavior.
+	NatHole NatHoleServerConfig `json:"natHole,omitempty"`
+
+	// Top-level aliases for NatHole settings. They are accepted for simple
+	// configuration layouts; values in NatHole take precedence.
+	NatHoleRelayPolicy      string `json:"natHoleRelayPolicy,omitempty"`
+	NatHoleAttemptTimeoutMs int64  `json:"natHoleAttemptTimeoutMs,omitempty"`
+	NatHoleRecordLimit      int    `json:"natHoleRecordLimit,omitempty"`
+	NatHoleRecordTTLHours   int    `json:"natHoleRecordTTLHours,omitempty"`
+
 	AllowPorts []types.PortsRange `json:"allowPorts,omitempty"`
 
 	HTTPPlugins []HTTPPluginOptions `json:"httpPlugins,omitempty"`

@@ -49,10 +49,17 @@ type XTCPVisitor struct {
 	cancel        context.CancelFunc
 
 	cfg *v1.XTCPVisitorConfig
+
+	fallbackMu       sync.Mutex
+	fallbackSignalCh chan struct{}
+	fallbackDecision *msg.NatHoleDecision
 }
+
+var ErrServerRelayFallback = errors.New("server relay fallback required")
 
 func (sv *XTCPVisitor) Run() (err error) {
 	sv.ctx, sv.cancel = context.WithCancel(sv.ctx)
+	sv.resetFallbackSignal()
 
 	if sv.cfg.Protocol == "kcp" {
 		sv.session = NewKCPTunnelSession()
@@ -136,6 +143,47 @@ func (sv *XTCPVisitor) keepTunnelOpenWorker() {
 	}
 }
 
+func (sv *XTCPVisitor) resetFallbackSignal() <-chan struct{} {
+	sv.fallbackMu.Lock()
+	old := sv.fallbackSignalCh
+	sv.fallbackDecision = nil
+	sv.fallbackSignalCh = make(chan struct{})
+	ch := sv.fallbackSignalCh
+	sv.fallbackMu.Unlock()
+
+	if old != nil {
+		select {
+		case <-old:
+		default:
+			close(old)
+		}
+	}
+	return ch
+}
+
+func (sv *XTCPVisitor) fallbackSignal() (<-chan struct{}, *msg.NatHoleDecision) {
+	sv.fallbackMu.Lock()
+	defer sv.fallbackMu.Unlock()
+	return sv.fallbackSignalCh, sv.fallbackDecision
+}
+
+func (sv *XTCPVisitor) notifyFallbackDecision(d *msg.NatHoleDecision) {
+	if d == nil || (d.Outcome != msg.NatHoleOutcomeRelay && d.Outcome != msg.NatHoleOutcomeFailed) {
+		return
+	}
+	sv.fallbackMu.Lock()
+	defer sv.fallbackMu.Unlock()
+	if sv.fallbackDecision != nil {
+		return
+	}
+	sv.fallbackDecision = d
+	select {
+	case <-sv.fallbackSignalCh:
+	default:
+		close(sv.fallbackSignalCh)
+	}
+}
+
 func (sv *XTCPVisitor) handleConn(userConn net.Conn) {
 	xl := xlog.FromContextSafe(sv.ctx)
 	isConnTransferred := false
@@ -163,12 +211,25 @@ func (sv *XTCPVisitor) handleConn(userConn net.Conn) {
 		defer cancel()
 		ctx = timeoutCtx
 	}
-	tunnelConn, err := sv.openTunnel(ctx)
+	var tunnelConn net.Conn
+	var err error
+	if sv.cfg.FallbackTo == "" && sv.cfg.ServerRelayFallbackEnabled() {
+		tunnelConn, err = sv.openTunnelOrRelay(ctx)
+	} else {
+		tunnelConn, err = sv.openTunnel(ctx)
+	}
 	if err != nil {
+		if errors.Is(err, ErrServerRelayFallback) {
+			tunnelErr = sv.joinServerRelay(userConn)
+			if tunnelErr != nil {
+				xl.Warnf("server relay fallback error: %v", tunnelErr)
+			}
+			return
+		}
 		xl.Errorf("open tunnel error: %v", err)
 		tunnelErr = err
 
-		// no fallback, just return
+		// no static fallback, just return
 		if sv.cfg.FallbackTo == "" {
 			return
 		}
@@ -197,6 +258,105 @@ func (sv *XTCPVisitor) handleConn(userConn net.Conn) {
 		xl.Tracef("join connections errors: %v", errs)
 	}
 }
+
+func (sv *XTCPVisitor) openTunnelOrRelay(ctx context.Context) (net.Conn, error) {
+	type tunnelResult struct {
+		conn net.Conn
+		err  error
+	}
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	tunnelCh := make(chan tunnelResult)
+	go func() {
+		conn, err := sv.openTunnel(ctx)
+		res := tunnelResult{conn: conn, err: err}
+		select {
+		case tunnelCh <- res:
+		case <-ctx.Done():
+			if conn != nil {
+				_ = conn.Close()
+			}
+		case <-sv.ctx.Done():
+			if conn != nil {
+				_ = conn.Close()
+			}
+		}
+	}()
+
+	for {
+		signalCh, decision := sv.fallbackSignal()
+		if decision != nil {
+			cancel()
+			if decision.Outcome == msg.NatHoleOutcomeFailed {
+				if decision.Error != "" {
+					return nil, fmt.Errorf("xtcp server relay fallback rejected: %s", decision.Error)
+				}
+				return nil, errRelayRejected
+			}
+			return nil, ErrServerRelayFallback
+		}
+		select {
+		case res := <-tunnelCh:
+			return res.conn, res.err
+		case <-signalCh:
+			// The broadcast may be a relay decision or a generation reset.
+			// Re-read the current state and retry with the new channel.
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-sv.ctx.Done():
+			return nil, sv.ctx.Err()
+		}
+	}
+}
+
+func (sv *XTCPVisitor) joinServerRelay(userConn net.Conn) error {
+	xl := xlog.FromContextSafe(sv.ctx)
+	baseCfg := sv.cfg.GetBaseConfig()
+	rawConn, err := sv.dialRawVisitorConn(baseCfg)
+	if err != nil {
+		xl.Warnf("dial server relay admission failed: %v", err)
+		return errRelayUnavailable
+	}
+
+	rwc, recycleFn, err := wrapVisitorConn(rawConn, baseCfg)
+	if err != nil {
+		rawConn.Close()
+		return errRelayUnavailable
+	}
+	defer recycleFn()
+
+	rw := msg.NewReadWriter(rwc, sv.clientCfg.Transport.WireProtocol)
+	if tcpConn, ok := rawConn.(*msg.Conn); ok {
+		_ = tcpConn.SetReadDeadline(time.Now().Add(10 * time.Second))
+	}
+	var sidMsg msg.NatHoleSid
+	if err := rw.ReadMsgInto(&sidMsg); err != nil {
+		_ = rawConn.Close()
+		return errRelayUnavailable
+	}
+	if tcpConn, ok := rawConn.(*msg.Conn); ok {
+		_ = tcpConn.SetReadDeadline(time.Time{})
+	}
+	if sidMsg.Error != "" || !sidMsg.Relay {
+		_ = rawConn.Close()
+		if sidMsg.Error != "" {
+			return fmt.Errorf("%w: %s", errRelayRejected, sidMsg.Error)
+		}
+		return errRelayUnavailable
+	}
+
+	xl.Infof("using server relay fallback for xtcp connection")
+	_, _, errs := libio.Join(userConn, rwc)
+	if len(errs) > 0 {
+		xl.Tracef("server relay join errors: %v", errs)
+	}
+	return nil
+}
+
+var (
+	errRelayUnavailable = errors.New("xtcp server relay is unavailable")
+	errRelayRejected    = errors.New("xtcp server relay was rejected")
+)
 
 // openTunnel will open a tunnel connection to the target server.
 func (sv *XTCPVisitor) openTunnel(ctx context.Context) (conn net.Conn, err error) {
@@ -253,6 +413,7 @@ func (sv *XTCPVisitor) makeNatHole() {
 	xl := xlog.FromContextSafe(sv.ctx)
 	targetProxyName := naming.BuildTargetServerProxyName(sv.clientCfg.User, sv.cfg.ServerUser, sv.cfg.ServerName)
 	xl.Tracef("makeNatHole start")
+	sv.resetFallbackSignal()
 	if err := nathole.PreCheck(sv.ctx, sv.helper.MsgTransporter(), targetProxyName, 5*time.Second); err != nil {
 		xl.Warnf("nathole precheck error: %v", err)
 		return
@@ -272,8 +433,8 @@ func (sv *XTCPVisitor) makeNatHole() {
 		return
 	}
 
-	xl.Infof("nathole prepare success, nat type: %s, behavior: %s, addresses: %v, assistedAddresses: %v",
-		prepareResult.NatType, prepareResult.Behavior, prepareResult.Addrs, prepareResult.AssistedAddrs)
+	xl.Infof("nathole prepare success, nat type: %s, behavior: %s, addresses: %d, assistedAddresses: %d",
+		prepareResult.NatType, prepareResult.Behavior, len(prepareResult.Addrs), len(prepareResult.AssistedAddrs))
 
 	listenConn := prepareResult.ListenConn
 
@@ -288,6 +449,7 @@ func (sv *XTCPVisitor) makeNatHole() {
 		Timestamp:     now,
 		MappedAddrs:   prepareResult.Addrs,
 		AssistedAddrs: prepareResult.AssistedAddrs,
+		RelayCapable:  sv.cfg.ServerRelayFallbackEnabled(),
 	}
 
 	xl.Tracef("nathole exchange info start")
@@ -298,24 +460,64 @@ func (sv *XTCPVisitor) makeNatHole() {
 		return
 	}
 
-	xl.Infof("get natHoleRespMsg, sid [%s], protocol [%s], candidate address %v, assisted address %v, detectBehavior: %+v",
-		natHoleRespMsg.Sid, natHoleRespMsg.Protocol, natHoleRespMsg.CandidateAddrs,
-		natHoleRespMsg.AssistedAddrs, natHoleRespMsg.DetectBehavior)
+	xl.Infof("get natHoleRespMsg, sid [%s], protocol [%s], candidate addresses: %d, assisted addresses: %d",
+		natHoleRespMsg.Sid, natHoleRespMsg.Protocol, len(natHoleRespMsg.CandidateAddrs),
+		len(natHoleRespMsg.AssistedAddrs))
+
+	sv.listenForDecision(natHoleRespMsg.Sid)
 
 	newListenConn, raddr, err := nathole.MakeHole(sv.ctx, listenConn, natHoleRespMsg, []byte(sv.cfg.SecretKey))
 	if err != nil {
 		listenConn.Close()
 		xl.Warnf("make hole error: %v", err)
+		_ = sv.helper.MsgTransporter().Send(&msg.NatHoleReport{
+			Sid:     natHoleRespMsg.Sid,
+			Success: false,
+			Reason:  "make_hole_failed",
+		})
 		return
 	}
 	listenConn = newListenConn
-	xl.Infof("establishing nat hole connection successful, sid [%s], remoteAddr [%s]", natHoleRespMsg.Sid, raddr)
+	xl.Infof("establishing nat hole connection successful, sid [%s]", natHoleRespMsg.Sid)
 
 	if err := sv.session.Init(listenConn, raddr); err != nil {
 		listenConn.Close()
 		xl.Warnf("init tunnel session error: %v", err)
+		_ = sv.helper.MsgTransporter().Send(&msg.NatHoleReport{
+			Sid:     natHoleRespMsg.Sid,
+			Success: false,
+			Reason:  "session_init_failed",
+		})
 		return
 	}
+	_ = sv.helper.MsgTransporter().Send(&msg.NatHoleReport{
+		Sid:       natHoleRespMsg.Sid,
+		Success:   true,
+		DataReady: true,
+	})
+}
+
+func (sv *XTCPVisitor) listenForDecision(sid string) {
+	if !sv.cfg.ServerRelayFallbackEnabled() || sid == "" {
+		return
+	}
+	w := nathole.DefaultDecisionHub.Register(sid)
+	go func() {
+		timer := time.NewTimer(45 * time.Second)
+		defer timer.Stop()
+		defer nathole.DefaultDecisionHub.Unregister(sid, w)
+		select {
+		case d := <-w.C():
+			if d == nil {
+				return
+			}
+			if d.Outcome == msg.NatHoleOutcomeRelay {
+				sv.notifyFallbackDecision(d)
+			}
+		case <-timer.C:
+		case <-sv.ctx.Done():
+		}
+	}()
 }
 
 type TunnelSession interface {

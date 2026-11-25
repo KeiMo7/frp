@@ -38,6 +38,7 @@ const (
 	TypeNatHoleResp        byte = 'm'
 	TypeNatHoleSid         byte = '5'
 	TypeNatHoleReport      byte = '6'
+	TypeNatHoleDecision    byte = '7'
 )
 
 var msgTypeMap = map[byte]any{
@@ -59,9 +60,11 @@ var msgTypeMap = map[byte]any{
 	TypeNatHoleResp:        NatHoleResp{},
 	TypeNatHoleSid:         NatHoleSid{},
 	TypeNatHoleReport:      NatHoleReport{},
+	TypeNatHoleDecision:    NatHoleDecision{},
 }
 
 var TypeNameNatHoleResp = reflect.TypeFor[NatHoleResp]().Name()
+var TypeNameNatHoleDecision = reflect.TypeFor[NatHoleDecision]().Name()
 
 type ClientSpec struct {
 	// Due to the support of VirtualClient, frps needs to know the client type in order to
@@ -128,6 +131,8 @@ type NewProxy struct {
 	// stcp, sudp, xtcp
 	Sk         string   `json:"sk,omitempty"`
 	AllowUsers []string `json:"allow_users,omitempty"`
+	// SkRelayFallback is the xtcp proxy's explicit opt-in to server relay.
+	SkRelayFallback bool `json:"sk_relay_fallback,omitempty"`
 
 	// tcpmux
 	Multiplexer string `json:"multiplexer,omitempty"`
@@ -198,6 +203,9 @@ type NatHoleVisitor struct {
 	Timestamp     int64    `json:"timestamp,omitempty"`
 	MappedAddrs   []string `json:"mapped_addrs,omitempty"`
 	AssistedAddrs []string `json:"assisted_addrs,omitempty"`
+	// RelayCapable indicates that this peer understands NatHoleDecision and can
+	// continue through frps when the direct path fails. Old peers omit it.
+	RelayCapable bool `json:"relay_capable,omitempty"`
 }
 
 type NatHoleClient struct {
@@ -206,6 +214,9 @@ type NatHoleClient struct {
 	Sid           string   `json:"sid,omitempty"`
 	MappedAddrs   []string `json:"mapped_addrs,omitempty"`
 	AssistedAddrs []string `json:"assisted_addrs,omitempty"`
+	// RelayCapable indicates that the proxy client understands relay-marked
+	// work connections and NatHoleDecision. Old clients omit this field.
+	RelayCapable bool `json:"relay_capable,omitempty"`
 }
 
 type PortsRange struct {
@@ -231,7 +242,14 @@ type NatHoleResp struct {
 	CandidateAddrs []string              `json:"candidate_addrs,omitempty"`
 	AssistedAddrs  []string              `json:"assisted_addrs,omitempty"`
 	DetectBehavior NatHoleDetectBehavior `json:"detect_behavior,omitempty"`
-	Error          string                `json:"error,omitempty"`
+	// Outcome carries a terminal conclusion in the negotiation response when
+	// address exchange cannot proceed. It uses NatHoleOutcome* values.
+	Outcome string `json:"outcome,omitempty"`
+	// Reason is a bounded, non-sensitive diagnostic code.
+	Reason string `json:"reason,omitempty"`
+	// AttemptTimeoutMs tells capable clients how long the server attempt lives.
+	AttemptTimeoutMs int    `json:"attempt_timeout_ms,omitempty"`
+	Error            string `json:"error,omitempty"`
 }
 
 type NatHoleSid struct {
@@ -239,9 +257,41 @@ type NatHoleSid struct {
 	Sid           string `json:"sid,omitempty"`
 	Response      bool   `json:"response,omitempty"`
 	Nonce         string `json:"nonce,omitempty"`
+	// Relay marks a work connection as a server-relay data leg rather than a
+	// hole-punching sid side channel.
+	Relay bool `json:"relay,omitempty"`
+	// Error carries a sanitized relay setup failure before byte forwarding
+	// begins.
+	Error string `json:"error,omitempty"`
 }
 
 type NatHoleReport struct {
 	Sid     string `json:"sid,omitempty"`
 	Success bool   `json:"success,omitempty"`
+	// Reason is a bounded diagnostic code. It must never contain addresses,
+	// credentials, or arbitrary underlying network errors.
+	Reason string `json:"reason,omitempty"`
+	// DataReady is false when the reporter reached hole punching success but
+	// could not establish/use the end-to-end tunnel data path.
+	DataReady bool `json:"data_ready,omitempty"`
 }
+
+// NatHoleDecision is the single terminal conclusion of one negotiation
+// attempt. frps sends it at most once to each capable participant.
+type NatHoleDecision struct {
+	TransactionID string `json:"transaction_id,omitempty"`
+	Sid           string `json:"sid,omitempty"`
+	// Outcome is one of NatHoleOutcomeRelay or NatHoleOutcomeFailed.
+	Outcome string `json:"outcome,omitempty"`
+	// Reason is a bounded stable diagnostic code. It never contains secrets or
+	// raw addresses.
+	Reason string `json:"reason,omitempty"`
+	// Error is a sanitized, user-facing explanation.
+	Error string `json:"error,omitempty"`
+}
+
+const (
+	NatHoleOutcomeDirect = "direct"
+	NatHoleOutcomeRelay  = "relay"
+	NatHoleOutcomeFailed = "failed"
+)

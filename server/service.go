@@ -343,7 +343,17 @@ func NewService(cfg *v1.ServerConfig) (*Service, error) {
 	})
 
 	// Create nat hole controller.
-	nc, err := nathole.NewController(time.Duration(cfg.NatHoleAnalysisDataReserveHours) * time.Hour)
+	natHoleCfg := cfg.ResolvedNatHole()
+	natHolePolicy := nathole.Policy{
+		ModernLifecycle:    natHoleCfg.ModernLifecycle(),
+		RelayAllowed:       natHoleCfg.RelayAllowed(),
+		ExplicitDirectOnly: natHoleCfg.ExplicitDirectOnly(),
+		AddressTimeout:     natHoleCfg.AddressTimeout(),
+		DataTimeout:        natHoleCfg.DataTimeout(),
+		RecordLimit:        natHoleCfg.RecordLimit,
+		RecordTTL:          natHoleCfg.RecordTTL(),
+	}
+	nc, err := nathole.NewControllerWithPolicy(time.Duration(cfg.NatHoleAnalysisDataReserveHours)*time.Hour, natHolePolicy)
 	if err != nil {
 		return nil, fmt.Errorf("create nat hole controller error, %v", err)
 	}
